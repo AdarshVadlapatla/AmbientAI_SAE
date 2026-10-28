@@ -69,6 +69,7 @@ def load_embedding_cache(cache_name: str) -> dict:
     
     cache_dir = f"{CACHE_DIR}/{cache_name}"
     if not os.path.exists(cache_dir):
+        print("missing ", cache_dir)
         return {}
     
     text2embedding = {}
@@ -201,6 +202,155 @@ def get_openai_embeddings(
         # Save completed chunk
         next_chunk_idx = _save_embedding_chunk(cache_name, chunk_embeddings, next_chunk_idx)
     
+    return text2embedding
+
+def chunk_texts(texts, tokenizer, max_tokens, batch=1000):
+    """Split each text into <= max_tokens chunks. Returns chunks, their text
+    index, and their token counts.
+
+    Encoding and decoding are done a batch at a time: the Rust tokenizer
+    threads a batch across all cores, while one-text-at-a-time calls stay
+    single-threaded.
+    """
+    chunks, doc_index, weights = [], [], []
+
+    for start in tqdm(range(0, len(texts), batch), desc="tokenizing"):
+        encoded = tokenizer(texts[start:start + batch], add_special_tokens=False)["input_ids"]
+        pieces, owners = [], []
+        for offset, ids in enumerate(encoded):
+            for begin in range(0, len(ids), max_tokens):
+                pieces.append(ids[begin:begin + max_tokens])
+                owners.append(start + offset)
+
+        chunks.extend(tokenizer.batch_decode(pieces))
+        doc_index.extend(owners)
+        weights.extend(len(piece) for piece in pieces)
+
+    return chunks, np.asarray(doc_index), np.asarray(weights, dtype=np.float32)
+
+def get_local_chunk_averaged_embeddings(
+    texts: List[str],
+    model: str = "Qwen/Qwen3-Embedding-0.6B",
+    batch_size: int = 1000,
+    show_progress: bool = True,
+    cache_name: Optional[str] = None,
+    cache_size: int = 5000,
+    max_tokens: int = 4000,
+    device: Optional[torch.device] = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+) -> Dict[str, np.ndarray]:
+    """Embed documents using token chunking and weighted averaging for longer text.
+    Preserves the existing text-level caching infrastructure.
+    Returns {original_text: document_embedding}.
+    """
+###PREPROCESSING AND SETUP###
+    #Filter invalid texts and empty strings
+    texts = filter_invalid_texts(texts)
+    #Load existing cache and return if cache contains all texts
+    text2embedding = load_embedding_cache(cache_name)
+    texts_to_embed = [text for text in texts if text not in text2embedding]
+    if not texts_to_embed:
+        return text2embedding
+    #Configure device and model
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
+    transformer_model = SentenceTransformer(model, device=device)
+
+    #Ensures there is no request for a context limit above the model's limit
+    supported_length = transformer_model.max_seq_length
+    if supported_length is not None and supported_length < max_tokens:
+        raise ValueError(
+            f"Model supports {supported_length} tokens, "
+            f"but max_seq_length={max_tokens} was requested."
+        )
+    print(f"Loaded {model} on {device}")
+    
+    #if same cache_name is given search for the next number in the sequence and append to name to avoid overwriting caches
+    next_chunk_idx = _get_next_chunk_index(cache_name)
+    #chunks total text for efficient calls to model
+    chunk_ranges = [(i, min(i + cache_size, len(texts_to_embed))) for i in range(0, len(texts_to_embed), cache_size)]
+    chunk_iterator = tqdm(chunk_ranges, desc="Processing and chunking document groups", disable=not show_progress)
+###End of SETUP and PREPROCESSING###
+###Begin Model Embedding Loop###
+    for chunk_start, chunk_end in chunk_iterator:
+        # Original documents in this cache group
+        doc_texts = texts_to_embed[chunk_start:chunk_end]
+        #Split documents into token chunks
+        chunks, doc_index, weights = chunk_texts(
+            doc_texts,
+            transformer_model.tokenizer,
+            max_tokens=max_tokens,
+        )
+        #Embed chunks in batches and accumulate weighted sums
+        weighted_sums = None
+        batch_iterator = tqdm(
+            range(0, len(chunks), batch_size),
+            desc=f"Embedding group {next_chunk_idx}",
+            disable=not show_progress,
+            leave=False,
+        )
+        for i in batch_iterator:
+            batch = chunks[i:i + batch_size]
+            # Preserve original model-specific prefixes
+            if "nomic-ai" in model:
+                prefixed_batch = [
+                    "clustering: " + text for text in batch]
+            elif "instructor" in model.lower():
+                prefixed_batch = [
+                    ["Represent the text for classification: ", text]
+                    for text in batch]
+            else:
+                prefixed_batch = batch
+
+            batch_embs = transformer_model.encode(
+                prefixed_batch,
+                batch_size=batch_size,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+            ).astype(np.float32)
+            #weighted sum for longer texts
+            if weighted_sums is None:
+                weighted_sums = np.zeros(
+                    (len(doc_texts), batch_embs.shape[1]),
+                    dtype=np.float32,
+                )
+            #Accumulate each chunk into its original document
+            np.add.at(
+                weighted_sums,
+                doc_index[i:i + batch_size],
+                batch_embs * weights[i:i + batch_size, None],
+            )
+
+        #Token-weighted average for each document
+        total_weights = np.bincount(
+            doc_index,
+            weights=weights,
+            minlength=len(doc_texts),
+        )
+
+        if np.any(total_weights == 0):
+            raise ValueError("A document produced zero tokens.")
+
+        final_embeddings = (weighted_sums / total_weights[:, None]).astype(np.float32)
+
+        #Update text -> document embedding mapping
+        chunk_embeddings = dict(zip(doc_texts, final_embeddings))
+        text2embedding.update(chunk_embeddings)
+
+        #Save completed document group to existing cache
+        next_chunk_idx = _save_embedding_chunk(
+            cache_name,
+            chunk_embeddings,
+            next_chunk_idx,
+        )
+
+    #Clean Resources
+    del transformer_model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     return text2embedding
 
 def get_local_embeddings(
